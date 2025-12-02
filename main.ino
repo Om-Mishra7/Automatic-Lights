@@ -16,85 +16,33 @@ String wifiPassword = "";
 /* ================= USER SETTINGS ================= */
 int DETECTION_DISTANCE_CM = 135;
 unsigned long MOTION_ON_TIME_MS = 120000;
-
 int alwaysOnStart = 18;
 int alwaysOnEnd = 22;
 int motionStart = 0;
 int motionEnd = 6;
 int overrideMode = 0;
 
-#define WIFI_TIMEOUT_MS 15000
-#define WIFI_RETRY_INTERVAL 300000
-
 /* ================= TIME CONFIG (IST) ================= */
 const char *ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 19800;
 const int daylightOffset_sec = 0;
 
-/* ================= TIME FALLBACK ================= */
-unsigned long lastTimeSyncMillis = 0;
-time_t lastUnixTime = 0;
-bool timeValid = false;
-
-/* ================= MOTION TIMER ================= */
-unsigned long motionTimer = 0;
-bool motionLightActive = false;
-
-/* ================= WEB SERVER ================= */
+/* ================= GLOBAL ================= */
 WebServer server(80);
 Preferences prefs;
-
-/* ================= GLOBAL ================= */
 float lastDistance = -1;
-unsigned long lastWiFiAttempt = 0;
+bool motionLightActive = false;
+unsigned long motionTimer = 0;
 bool apActive = false;
 
-/* ================= OTA SETUP ================= */
+/* ================= OTA ================= */
 void setupOTA()
 {
   ArduinoOTA.setHostname("AutoLightESP32");
-
-  ArduinoOTA.onStart([]()
-                     { Serial.println("OTA Update Start"); });
-
-  ArduinoOTA.onEnd([]()
-                   { Serial.println("OTA Update Complete"); });
-
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total)
-                        { Serial.printf("OTA Progress: %u%%\n", (progress * 100) / total); });
-
-  ArduinoOTA.onError([](ota_error_t error)
-                     { Serial.printf("OTA Error[%u]\n", error); });
-
   ArduinoOTA.begin();
 }
 
-/* ================= SETUP ================= */
-void setup()
-{
-  Serial.begin(115200);
-  prefs.begin("AutoLight", false);
-  loadSettings();
-
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH);
-
-#ifndef LED_BUILTIN
-#define LED_BUILTIN 2
-#endif
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);
-
-  WiFi.onEvent(WiFiEvent);
-  connectWiFiAndSyncTime();
-
-  setupOTA(); // ✅ OTA ENABLED
-  setupWebServer();
-}
-
-/* ================= LOAD SETTINGS ================= */
+/* ================= PREFERENCES ================= */
 void loadSettings()
 {
   wifiSsid = prefs.getString("ssid", "");
@@ -108,18 +56,26 @@ void loadSettings()
   overrideMode = prefs.getInt("ovr", overrideMode);
 }
 
-/* ================= WIFI EVENT ================= */
+void saveSettings()
+{
+  prefs.putInt("aos", alwaysOnStart);
+  prefs.putInt("aoe", alwaysOnEnd);
+  prefs.putInt("ms", motionStart);
+  prefs.putInt("me", motionEnd);
+  prefs.putInt("dist", DETECTION_DISTANCE_CM);
+  prefs.putULong("mtn", MOTION_ON_TIME_MS);
+  prefs.putInt("ovr", overrideMode);
+}
+
+/* ================= WIFI ================= */
 void WiFiEvent(arduino_event_id_t event)
 {
   if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP)
   {
-    Serial.println("WiFi Connected");
-    apActive = false;
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
   }
   else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED)
   {
-    Serial.println("WiFi Disconnected");
     if (wifiSsid.length() == 0)
     {
       WiFi.softAP("AutoLight_Config");
@@ -128,59 +84,31 @@ void WiFiEvent(arduino_event_id_t event)
   }
 }
 
-/* ================= WIFI CONNECT ================= */
 void connectWiFiAndSyncTime()
 {
   WiFi.mode(WIFI_STA);
-
   if (wifiSsid.length() > 0)
   {
     WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
   }
   else
   {
-    WiFi.mode(WIFI_AP_STA);
     WiFi.softAP("AutoLight_Config");
     apActive = true;
-    return;
-  }
-
-  unsigned long startAttempt = millis();
-  while (WiFi.status() != WL_CONNECTED &&
-         millis() - startAttempt < WIFI_TIMEOUT_MS)
-  {
-    delay(300);
-  }
-
-  if (WiFi.status() != WL_CONNECTED)
-  {
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP("AutoLight_Config");
-    apActive = true;
-  }
-}
-
-/* ================= WIFI MAINTAIN ================= */
-void maintainWiFi()
-{
-  if (WiFi.status() != WL_CONNECTED &&
-      millis() - lastWiFiAttempt > WIFI_RETRY_INTERVAL)
-  {
-    lastWiFiAttempt = millis();
-    WiFi.disconnect();
-    WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
   }
 }
 
 /* ================= TIME ================= */
-int getCurrentHour()
+String getTimeString()
 {
   struct tm timeinfo;
-  if (WiFi.status() == WL_CONNECTED && getLocalTime(&timeinfo))
+  if (getLocalTime(&timeinfo))
   {
-    return timeinfo.tm_hour;
+    char buf[20];
+    strftime(buf, sizeof(buf), "%H:%M:%S", &timeinfo);
+    return String(buf);
   }
-  return -1;
+  return "No Time";
 }
 
 /* ================= SENSOR ================= */
@@ -237,71 +165,119 @@ void relayOFF() { digitalWrite(RELAY_PIN, HIGH); }
 void setupWebServer()
 {
 
+  // DASHBOARD
   server.on("/", []()
             {
-    String page = "<h2>ESP32 AUTO LIGHT</h2>";
-    page += "<a href='/wifi'><button>WiFi Setup</button></a><br><br>";
-    page += "<a href='/distance'><button>Live Distance</button></a><br><br>";
-    page += "<a href='/set'><button>Settings</button></a><br><br>";
-    page += "<a href='/forgetwifi'><button>Forget WiFi</button></a><br><br>";
-    server.send(200, "text/html", page); });
+    String page = R"rawliteral(
+<html>
+<head>
+<style>
+body{background:#111;color:#0f0;font-family:Arial;text-align:center}
+.card{background:#222;padding:20px;margin:10px;border-radius:10px}
+.btn{padding:10px 20px;margin:8px;border-radius:8px}
+</style>
+</head>
+<body>
+<h2>ESP32 AUTO LIGHT</h2>
+<div class="card">
+  Status: <b><span id="status">--</span></b><br>
+  Distance: <b><span id="dist">--</span> cm</b><br>
+  Time: <b><span id="time">--</span></b>
+</div>
+<a href="/wifi"><button class="btn">WiFi</button></a>
+<a href="/set"><button class="btn">Settings</button></a>
+<a href="/forgetwifi"><button class="btn">Reset WiFi</button></a>
 
+<script>
+function update(){
+ fetch('/api/status').then(r=>r.json()).then(d=>{
+   document.getElementById('dist').innerText=d.distance;
+   document.getElementById('time').innerText=d.time;
+   document.getElementById('status').innerText=d.status;
+ });
+}
+setInterval(update,1000);update();
+</script>
+</body>
+</html>
+)rawliteral";
+    server.send(200,"text/html",page); });
+
+  // API
+  server.on("/api/status", []()
+            {
+    String status = motionLightActive ? "ON" : "WAITING";
+    server.send(200,"application/json",
+      "{\"distance\":"+String(lastDistance)+",\"time\":\""+getTimeString()+"\",\"status\":\""+status+"\"}"); });
+
+  // WIFI PAGE
   server.on("/wifi", []()
             {
-    String page = "<form action='/savewifi' method='POST'>";
-    page += "SSID: <input name='ssid'><br>";
-    page += "PASS: <input name='pw'><br>";
-    page += "<input type='submit'></form>";
-    server.send(200, "text/html", page); });
+    String page="<h2>WiFi Setup</h2><form action='/savewifi' method='POST'>"
+                "SSID:<input name='ssid' value='"+wifiSsid+"'><br>"
+                "PASS:<input name='pw' value='"+wifiPassword+"'><br>"
+                "<input type='submit'></form><a href='/'>Back</a>";
+    server.send(200,"text/html",page); });
 
   server.on("/savewifi", HTTP_POST, []()
             {
-    wifiSsid = server.arg("ssid");
-    wifiPassword = server.arg("pw");
-    prefs.putString("ssid", wifiSsid);
-    prefs.putString("pw", wifiPassword);
-    WiFi.disconnect();
-    WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
-    server.send(200, "text/html", "Saved. <a href='/'>Back</a>"); });
+    wifiSsid=server.arg("ssid");
+    wifiPassword=server.arg("pw");
+    prefs.putString("ssid",wifiSsid);
+    prefs.putString("pw",wifiPassword);
+    WiFi.disconnect(); WiFi.begin(wifiSsid.c_str(),wifiPassword.c_str());
+    server.send(200,"text/html","Saved <a href='/'>Back</a>"); });
 
   server.on("/forgetwifi", []()
             {
-    prefs.clear();
-    wifiSsid = "";
-    wifiPassword = "";
-    WiFi.disconnect();
-    WiFi.softAP("AutoLight_Config");
-    apActive = true;
-    server.send(200, "text/html", "WiFi Cleared. <a href='/'>Back</a>"); });
+    prefs.remove("ssid"); prefs.remove("pw");
+    WiFi.disconnect(); WiFi.softAP("AutoLight_Config");
+    server.send(200,"text/html","Reset Done <a href='/'>Back</a>"); });
 
+  // SETTINGS
   server.on("/set", []()
             {
-    String page = "<form action='/savesettings' method='POST'>";
-    page += "Always ON Start:<input name='aos'><br>";
-    page += "Always ON End:<input name='aoe'><br>";
-    page += "Motion Start:<input name='ms'><br>";
-    page += "Motion End:<input name='me'><br>";
-    page += "Distance:<input name='dist'><br>";
-    page += "Time(ms):<input name='time'><br>";
-    page += "<input type='submit'></form>";
-    server.send(200, "text/html", page); });
+    String page="<form action='/savesettings' method='POST'>"
+    "Always ON Start:<input name='aos' value='"+String(alwaysOnStart)+"'><br>"
+    "Always ON End:<input name='aoe' value='"+String(alwaysOnEnd)+"'><br>"
+    "Motion Start:<input name='ms' value='"+String(motionStart)+"'><br>"
+    "Motion End:<input name='me' value='"+String(motionEnd)+"'><br>"
+    "Distance:<input name='dist' value='"+String(DETECTION_DISTANCE_CM)+"'><br>"
+    "Time(ms):<input name='time' value='"+String(MOTION_ON_TIME_MS)+"'><br>"
+    "<input type='submit'></form>";
+    server.send(200,"text/html",page); });
 
   server.on("/savesettings", HTTP_POST, []()
             {
-    alwaysOnStart = server.arg("aos").toInt();
-    alwaysOnEnd   = server.arg("aoe").toInt();
-    motionStart   = server.arg("ms").toInt();
-    motionEnd     = server.arg("me").toInt();
-    DETECTION_DISTANCE_CM = server.arg("dist").toInt();
-    MOTION_ON_TIME_MS = server.arg("time").toInt();
-    server.send(200, "text/html", "Saved. <a href='/'>Back</a>"); });
-
-  server.on("/distance", []()
-            {
-    lastDistance = getFilteredDistance();
-    server.send(200, "text/plain", String(lastDistance)); });
+    alwaysOnStart=server.arg("aos").toInt();
+    alwaysOnEnd=server.arg("aoe").toInt();
+    motionStart=server.arg("ms").toInt();
+    motionEnd=server.arg("me").toInt();
+    DETECTION_DISTANCE_CM=server.arg("dist").toInt();
+    MOTION_ON_TIME_MS=server.arg("time").toInt();
+    saveSettings();
+    server.sendHeader("Location","/");
+    server.send(302); });
 
   server.begin();
+}
+
+/* ================= SETUP ================= */
+void setup()
+{
+  Serial.begin(115200);
+  prefs.begin("AutoLight", false);
+  loadSettings();
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);
+
+  WiFi.onEvent(WiFiEvent);
+  connectWiFiAndSyncTime();
+  setupOTA();
+  setupWebServer();
 }
 
 /* ================= LOOP ================= */
@@ -309,55 +285,21 @@ void loop()
 {
   ArduinoOTA.handle();
   server.handleClient();
-  maintainWiFi();
 
-  int hour = getCurrentHour();
+  lastDistance = getFilteredDistance();
 
-  // FORCE MODES
-  if (overrideMode == 1)
+  if ((lastDistance > 0 && lastDistance < DETECTION_DISTANCE_CM) || lastDistance == -1)
   {
     relayON();
-    return;
-  }
-  if (overrideMode == 2)
-  {
-    relayOFF();
-    return;
+    motionLightActive = true;
+    motionTimer = millis();
   }
 
-  // ALWAYS ON MODE
-  if (hour != -1 && hour >= alwaysOnStart && hour < alwaysOnEnd)
-  {
-    relayON();
-    motionLightActive = false;
-  }
-
-  else if (hour == -1 || (hour >= motionStart && hour < motionEnd))
-  {
-
-    lastDistance = getFilteredDistance();
-
-    if ((lastDistance > 0 && lastDistance < DETECTION_DISTANCE_CM) || lastDistance == -1)
-    {
-      relayON();
-      motionTimer = millis();
-      motionLightActive = true;
-    }
-
-    if (motionLightActive &&
-        millis() - motionTimer >= MOTION_ON_TIME_MS)
-    {
-      relayOFF();
-      motionLightActive = false;
-    }
-  }
-
-  // OFF HOURS
-  else
+  if (motionLightActive && millis() - motionTimer >= MOTION_ON_TIME_MS)
   {
     relayOFF();
     motionLightActive = false;
   }
 
-  delay(300);
+  delay(200);
 }
